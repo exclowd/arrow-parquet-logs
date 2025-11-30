@@ -1,18 +1,93 @@
 """
 Log Reader Module - Efficient log reading and filtering from Parquet archives and Arrow buffers
+Optimized using pyarrow.dataset APIs for fast, parallel scanning and push-down filters
+
+Key optimizations:
+- Uses pyarrow.dataset for parallel scanning of Parquet files
+- Push-down filters at dataset level for better performance
+- Memory-mapped IPC files for efficient buffer reading
+- Shared FilterUtils for DRY filter application
+- Minimizes to_pylist() conversions until final output
+- Uses Arrow compute functions for vectorized filtering
 """
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Generator, Tuple
 import pyarrow as pa
 import pyarrow.ipc as ipc
-import pyarrow.parquet as pq
 import pyarrow.compute as pc
+import pyarrow.dataset as ds
 import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class FilterUtils:
+    """Utilities to build dataset-pushdown filters and in-memory masks."""
+
+    @staticmethod
+    def to_dataset_filters(filters: Optional[List[Tuple]]) -> Optional[ds.Expression]:
+        """
+        Convert simple (col, op, val) filters into a pyarrow.dataset expression
+        for push-down filtering at the dataset level.
+        Supported ops: '>=', '<=', '==', '!=', '>', '<'
+        """
+        if not filters:
+            return None
+
+        expr: Optional[ds.Expression] = None
+        for col, op, val in filters:
+            field = ds.field(col)
+            if op == '>=':
+                e = field >= val
+            elif op == '<=':
+                e = field <= val
+            elif op == '==':
+                e = field == val
+            elif op == '!=':
+                e = field != val
+            elif op == '>':
+                e = field > val
+            elif op == '<':
+                e = field < val
+            else:
+                # Unknown operator — skip
+                continue
+
+            expr = e if expr is None else (expr & e)
+        return expr
+
+    @staticmethod
+    def build_arrow_mask(batch: pa.RecordBatch, filters: Optional[List[Tuple]]) -> Optional[pa.Array]:
+        """Build an Arrow boolean mask for a RecordBatch using pyarrow.compute."""
+        if not filters:
+            return None
+
+        mask: Optional[pa.Array] = None
+        for col, op, val in filters:
+            arr = batch[col]
+            if op == '>=':
+                m = pc.greater_equal(arr, val)
+            elif op == '<=':
+                m = pc.less_equal(arr, val)
+            elif op == '==':
+                m = pc.equal(arr, val)
+            elif op == '!=':
+                m = pc.not_equal(arr, val)
+            elif op == '>':
+                m = pc.greater(arr, val)
+            elif op == '<':
+                m = pc.less(arr, val)
+            else:
+                continue
+
+            mask = m if mask is None else pc.and_kleene(mask, m)
+        return mask
 
 
 class ArchiveReader:
-    """Reader for archived Parquet log files"""
+    """Reader for archived Parquet log files using pyarrow.dataset for optimized scanning"""
 
     def __init__(self, archive_files: List[Dict[str, Any]]):
         """
@@ -22,10 +97,26 @@ class ArchiveReader:
             archive_files: List of dicts with 'archive_path' and metadata
         """
         self.archive_files = archive_files
+        # Build list of valid paths for dataset
+        self.valid_paths = []
+        for file_info in archive_files:
+            path = Path(file_info['archive_path'])
+            if path.exists():
+                self.valid_paths.append(str(path))
+
+    def _get_dataset(self) -> Optional[ds.Dataset]:
+        """Create a dataset from valid archive paths"""
+        if not self.valid_paths:
+            return None
+        try:
+            return ds.dataset(self.valid_paths, format='parquet')
+        except Exception as e:
+            logger.warning(f"Could not create dataset: {e}")
+            return None
 
     def read_all(self, filters: Optional[List[Tuple]] = None) -> List[Dict[str, Any]]:
         """
-        Read all logs from archive files
+        Read all logs from archive files using dataset API
 
         Args:
             filters: Optional list of (column, operator, value) tuples
@@ -33,32 +124,30 @@ class ArchiveReader:
         Returns:
             List of log entries as dictionaries
         """
-        all_logs = []
+        dataset = self._get_dataset()
+        if not dataset:
+            return []
 
-        for file_info in self.archive_files:
-            archive_path = Path(file_info['archive_path'])
-            if not archive_path.exists():
-                continue
+        try:
+            # Use dataset push-down filters for efficiency
+            ds_filter = FilterUtils.to_dataset_filters(filters)
+            table = dataset.to_table(filter=ds_filter)
 
-            # Use Parquet push-down filters for efficiency
-            if filters:
-                table = pq.read_table(archive_path, filters=filters)
-            else:
-                table = pq.read_table(archive_path)
-
-            # Convert to list of dicts with minimal copying
+            # Convert to list of dicts
             if table.num_rows > 0:
                 rows = table.to_pylist()
                 for row in rows:
                     if row.get('timestamp'):
                         row['timestamp'] = row['timestamp'].isoformat()
-                    all_logs.append(row)
-
-        return all_logs
+                return rows
+            return []
+        except Exception as e:
+            logger.error(f"Error reading archive files: {e}")
+            return []
 
     def stream(self, filters: Optional[List[Tuple]] = None, batch_size: int = 1000) -> Generator[Dict[str, Any], None, None]:
         """
-        Stream logs from archive files
+        Stream logs from archive files using dataset scanner
 
         Args:
             filters: Optional list of (column, operator, value) tuples
@@ -67,33 +156,31 @@ class ArchiveReader:
         Yields:
             Individual log entries as dictionaries
         """
-        for file_info in self.archive_files:
-            archive_path = Path(file_info['archive_path'])
-            if not archive_path.exists():
-                continue
+        dataset = self._get_dataset()
+        if not dataset:
+            return
 
-            # Open Parquet file for batch reading
-            parquet_file = pq.ParquetFile(archive_path)
+        try:
+            # Use dataset scanner with push-down filters
+            ds_filter = FilterUtils.to_dataset_filters(filters)
+            scanner = dataset.scanner(filter=ds_filter, batch_size=batch_size)
 
-            # Iterate through batches for memory efficiency
-            for batch in parquet_file.iter_batches(batch_size=batch_size):
-                # Apply filters if Parquet doesn't support them at read time
-                if filters:
-                    batch = self._apply_filters(batch, filters)
-
+            # Stream batches
+            for batch in scanner.to_batches():
                 if batch.num_rows == 0:
                     continue
 
-                # Convert batch to Python objects
                 rows = batch.to_pylist()
                 for row in rows:
                     if row.get('timestamp'):
                         row['timestamp'] = row['timestamp'].isoformat()
                     yield row
+        except Exception as e:
+            logger.error(f"Error streaming archive files: {e}")
 
     def count(self, filters: Optional[List[Tuple]] = None) -> int:
         """
-        Count logs in archive files
+        Count logs in archive files using dataset
 
         Args:
             filters: Optional list of (column, operator, value) tuples
@@ -101,23 +188,22 @@ class ArchiveReader:
         Returns:
             Total number of matching log entries
         """
-        total = 0
+        dataset = self._get_dataset()
+        if not dataset:
+            return 0
 
-        for file_info in self.archive_files:
-            archive_path = Path(file_info['archive_path'])
-            if not archive_path.exists():
-                continue
+        try:
+            ds_filter = FilterUtils.to_dataset_filters(filters)
+            scanner = dataset.scanner(filter=ds_filter)
 
-            # Read with filters to get accurate count
-            if filters:
-                table = pq.read_table(archive_path, filters=filters, columns=['timestamp'])
-                total += table.num_rows
-            else:
-                # Just read metadata for count
-                parquet_file = pq.ParquetFile(archive_path)
-                total += parquet_file.metadata.num_rows
-
-        return total
+            # Count rows efficiently
+            total = 0
+            for batch in scanner.to_batches():
+                total += batch.num_rows
+            return total
+        except Exception as e:
+            logger.error(f"Error counting archive files: {e}")
+            return 0
 
     def get_summary(self) -> Dict[str, Any]:
         """
@@ -126,21 +212,23 @@ class ArchiveReader:
         Returns:
             Dictionary with summary stats
         """
-        files_scanned = 0
+        files_scanned = len(self.valid_paths)
         total_rows = 0
         total_size = 0
 
-        for file_info in self.archive_files:
-            archive_path = Path(file_info['archive_path'])
-            if not archive_path.exists():
-                continue
+        for path_str in self.valid_paths:
+            path = Path(path_str)
+            total_size += path.stat().st_size
 
-            files_scanned += 1
-
-            # Use metadata for fast stats
-            parquet_file = pq.ParquetFile(archive_path)
-            total_rows += parquet_file.metadata.num_rows
-            total_size += archive_path.stat().st_size
+        # Use dataset to count total rows efficiently
+        dataset = self._get_dataset()
+        if dataset:
+            try:
+                scanner = dataset.scanner()
+                for batch in scanner.to_batches():
+                    total_rows += batch.num_rows
+            except Exception:
+                pass
 
         return {
             'files_scanned': files_scanned,
@@ -148,43 +236,9 @@ class ArchiveReader:
             'total_size_bytes': total_size
         }
 
-    def _apply_filters(self, batch, filters: List[Tuple]):
-        """
-        Apply filters to a RecordBatch
-
-        Args:
-            batch: Arrow RecordBatch
-            filters: List of (column, operator, value) tuples
-
-        Returns:
-            Filtered RecordBatch
-        """
-        mask = None
-
-        for col, op, val in filters:
-            if op == '>=':
-                bmask = pc.greater_equal(batch[col], val)
-            elif op == '<=':
-                bmask = pc.less_equal(batch[col], val)
-            elif op == '==':
-                bmask = pc.equal(batch[col], val)
-            elif op == '!=':
-                bmask = pc.not_equal(batch[col], val)
-            else:
-                continue
-
-            if mask is None:
-                mask = bmask
-            else:
-                mask = pc.and_kleene(mask, bmask)
-
-        if mask is not None:
-            return batch.filter(mask)
-        return batch
-
 
 class BufferReader:
-    """Reader for active Arrow IPC buffer files"""
+    """Reader for active Arrow IPC buffer files with memory mapping"""
 
     def __init__(self, buffer_files: List[Path]):
         """
@@ -197,7 +251,7 @@ class BufferReader:
 
     def read_all(self, filters: Optional[List[Tuple]] = None) -> List[Dict[str, Any]]:
         """
-        Read all logs from buffer files
+        Read all logs from buffer files using memory mapping
 
         Args:
             filters: Optional list of (column, operator, value) tuples
@@ -212,19 +266,23 @@ class BufferReader:
                 continue
 
             try:
-                # Read Arrow IPC file
+                # Memory-map the IPC file for efficient reading
                 with pa.memory_map(str(buffer_path), 'r') as source:
                     reader = ipc.open_file(source)
                     table = reader.read_all()
 
-                # Apply filters if needed
+                # Apply filters if needed using FilterUtils
                 if filters and table.num_rows > 0:
-                    # Convert table to batches for filtering
                     filtered_batches = []
                     for batch in table.to_batches():
-                        filtered_batch = self._apply_filters(batch, filters)
-                        if filtered_batch.num_rows > 0:
-                            filtered_batches.append(filtered_batch)
+                        mask = FilterUtils.build_arrow_mask(batch, filters)
+                        if mask is not None:
+                            filtered_batch = batch.filter(mask)
+                            if filtered_batch.num_rows > 0:
+                                filtered_batches.append(filtered_batch)
+                        else:
+                            filtered_batches.append(batch)
+
                     if filtered_batches:
                         table = pa.Table.from_batches(filtered_batches)
                     else:
@@ -238,15 +296,14 @@ class BufferReader:
                             row['timestamp'] = row['timestamp'].isoformat()
                         all_logs.append(row)
             except Exception as e:
-                # Skip corrupted or incomplete buffer files
-                print(f"Warning: Could not read buffer file {buffer_path}: {e}")
+                logger.warning(f"Could not read buffer file {buffer_path}: {e}")
                 continue
 
         return all_logs
 
     def stream(self, filters: Optional[List[Tuple]] = None, batch_size: int = 1000) -> Generator[Dict[str, Any], None, None]:
         """
-        Stream logs from buffer files
+        Stream logs from buffer files with memory mapping
 
         Args:
             filters: Optional list of (column, operator, value) tuples
@@ -260,7 +317,7 @@ class BufferReader:
                 continue
 
             try:
-                # Read Arrow IPC file
+                # Memory-map the IPC file
                 with pa.memory_map(str(buffer_path), 'r') as source:
                     reader = ipc.open_file(source)
 
@@ -268,9 +325,11 @@ class BufferReader:
                     for i in range(reader.num_record_batches):
                         batch = reader.get_batch(i)
 
-                        # Apply filters if needed
+                        # Apply filters using FilterUtils
                         if filters:
-                            batch = self._apply_filters(batch, filters)
+                            mask = FilterUtils.build_arrow_mask(batch, filters)
+                            if mask is not None:
+                                batch = batch.filter(mask)
 
                         if batch.num_rows == 0:
                             continue
@@ -282,8 +341,7 @@ class BufferReader:
                                 row['timestamp'] = row['timestamp'].isoformat()
                             yield row
             except Exception as e:
-                # Skip corrupted or incomplete buffer files
-                print(f"Warning: Could not read buffer file {buffer_path}: {e}")
+                logger.warning(f"Could not read buffer file {buffer_path}: {e}")
                 continue
 
     def count(self, filters: Optional[List[Tuple]] = None) -> int:
@@ -310,8 +368,12 @@ class BufferReader:
                     if filters:
                         for i in range(reader.num_record_batches):
                             batch = reader.get_batch(i)
-                            filtered_batch = self._apply_filters(batch, filters)
-                            total += filtered_batch.num_rows
+                            mask = FilterUtils.build_arrow_mask(batch, filters)
+                            if mask is not None:
+                                filtered_batch = batch.filter(mask)
+                                total += filtered_batch.num_rows
+                            else:
+                                total += batch.num_rows
                     else:
                         # Just count rows
                         for i in range(reader.num_record_batches):
@@ -363,7 +425,7 @@ class BufferReader:
 
     def _apply_filters(self, batch, filters: List[Tuple]):
         """
-        Apply filters to a RecordBatch
+        Apply filters to a RecordBatch using FilterUtils
 
         Args:
             batch: Arrow RecordBatch
@@ -372,25 +434,7 @@ class BufferReader:
         Returns:
             Filtered RecordBatch
         """
-        mask = None
-
-        for col, op, val in filters:
-            if op == '>=':
-                bmask = pc.greater_equal(batch[col], val)
-            elif op == '<=':
-                bmask = pc.less_equal(batch[col], val)
-            elif op == '==':
-                bmask = pc.equal(batch[col], val)
-            elif op == '!=':
-                bmask = pc.not_equal(batch[col], val)
-            else:
-                continue
-
-            if mask is None:
-                mask = bmask
-            else:
-                mask = pc.and_kleene(mask, bmask)
-
+        mask = FilterUtils.build_arrow_mask(batch, filters)
         if mask is not None:
             return batch.filter(mask)
         return batch
@@ -429,6 +473,19 @@ class LogReader:
             self.filters.append(('timestamp', '<=', end_time))
         return self
 
+    def with_filters(self, filters: List[Tuple]) -> 'LogReader':
+        """
+        Add custom filters
+
+        Args:
+            filters: List of (column, operator, value) tuples
+
+        Returns:
+            Self for chaining
+        """
+        self.filters.extend(filters)
+        return self
+
     def read_all(self) -> List[Dict[str, Any]]:
         """
         Read all logs from both archive and buffer files
@@ -441,13 +498,13 @@ class LogReader:
         # Read from archive files
         archive_logs = self.archive_reader.read_all(self.filters if self.filters else None)
 
-        print(f"Debug: Retrieved {len(archive_logs)} logs from archive files.")
+        logger.debug(f"Retrieved {len(archive_logs)} logs from archive files.")
 
         all_logs.extend(archive_logs)
 
         buffer_logs = self.buffer_reader.read_all(self.filters if self.filters else None)
 
-        print(f"Debug: Retrieved {len(buffer_logs)} logs from buffer files.")
+        logger.debug(f"Retrieved {len(buffer_logs)} logs from buffer files.")
 
         all_logs.extend(buffer_logs)
 
@@ -542,7 +599,7 @@ class LogReaderFactory:
         # Get archived files from metadata DB
         archive_files = metadata_db.get_session_files(container, session)
 
-        print(f"Debug: Found {len(archive_files)} archived files for container '{container}', session '{session}'.")
+        logger.debug(f"Found {len(archive_files)} archived files for container '{container}', session '{session}'.")
 
         # Get active buffer files from file system
         session_buffer_dir = buffer_dir / container / f"session_{session}"
@@ -550,7 +607,7 @@ class LogReaderFactory:
         if session_buffer_dir.exists():
             buffer_files = sorted(session_buffer_dir.glob("buffer-*.arrow"))
 
-        print(f"Debug: Found {buffer_files=} buffer files for container '{container}', session '{session}'.")
+        logger.debug(f"Found {len(buffer_files)} buffer files for container '{container}', session '{session}'.")
         archive_reader = ArchiveReader(archive_files)
         buffer_reader = BufferReader(buffer_files)
 
