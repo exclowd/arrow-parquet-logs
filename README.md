@@ -1,5 +1,11 @@
 # Log Server using Arrow IPC and Parquet
 
+## Thesis:
+If I can keep python out as much as possible, and just use it as a thin API layer.
+Where the heavy lifting of log storage and querying is done by Arrow and Parquet,
+then I can achieve high performance log streaming and querying with minimal overhead
+and complexity.
+
 ## Overview
 
 This API provides a high-performance log streaming service with:
