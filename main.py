@@ -4,11 +4,20 @@ import signal
 import sys
 import json
 from datetime import datetime
+import traceback
+import logging
 
 from auth import require_authN, AuthDB
 from metadata import MetadataDB
 from writer import BufferManager, create_record_batch
 from reader import LogReaderFactory
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -36,32 +45,6 @@ buffer_manager = BufferManager(
     metadata_db,
     BUFFER_SIZE_LIMIT
 )
-
-
-@app.route('/')
-def home():
-    return jsonify({
-        'message': 'Welcome to the Flask Log API',
-        'status': 'running',
-        'endpoints': {
-            'auth': {
-                'POST /api/auth/login': 'Login and get token',
-                'POST /api/auth/logout': 'Logout and revoke token'
-            },
-            'containers': {
-                'POST /api/containers': 'Create a new container',
-                'GET /api/containers': 'List user containers'
-            },
-            'sessions': {
-                'POST /api/containers/<container>/sessions': 'Create a new session',
-                'GET /api/containers/<container>/sessions': 'List container sessions'
-            },
-            'logs': {
-                'POST /api/logs/<container>/<session>': 'Write logs to session',
-                'GET /api/logs/<container>/<session>': 'Read logs from session'
-            }
-        }
-    })
 
 # ============= AUTH ENDPOINTS =============
 
@@ -91,7 +74,10 @@ def login():
         }), 200
 
     except Exception as e:
+        logger.error(f"Error in login: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/auth/logout', methods=['POST'])
 @require_authN(auth_db)
@@ -101,9 +87,12 @@ def logout(user_id, token):
         auth_db.revoke_token(token)
         return jsonify({'message': 'Logged out successfully'}), 200
     except Exception as e:
+        logger.error(f"Error in logout: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 # ============= CONTAINER ENDPOINTS =============
+
 
 @app.route('/api/containers', methods=['POST'])
 @require_authN(auth_db)
@@ -132,7 +121,10 @@ def create_container(user_id, token):
         }), 201
 
     except Exception as e:
+        logger.error(f"Error in create_container: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/containers', methods=['GET'])
 @require_authN(auth_db)
@@ -146,9 +138,12 @@ def list_containers(user_id, token):
             'count': len(containers)
         }), 200
     except Exception as e:
+        logger.error(f"Error in list_containers: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 # ============= SESSION ENDPOINTS =============
+
 
 @app.route('/api/containers/<container_id>/sessions', methods=['POST'])
 @require_authN(auth_db)
@@ -184,7 +179,10 @@ def create_session(user_id, token, container_id):
         }), 201
 
     except Exception as e:
+        logger.error(f"Error in create_session: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/containers/<container_id>/sessions', methods=['GET'])
 @require_authN(auth_db)
@@ -203,7 +201,8 @@ def list_sessions(user_id, token, container_id):
             session_copy = session.copy()
             # Remove container prefix if present
             if session_copy['session_id'].startswith(prefix):
-                session_copy['session_id'] = session_copy['session_id'][len(prefix):]
+                session_copy['session_id'] = session_copy['session_id'][len(
+                    prefix):]
             formatted_sessions.append(session_copy)
 
         return jsonify({
@@ -213,9 +212,12 @@ def list_sessions(user_id, token, container_id):
             'count': len(formatted_sessions)
         }), 200
     except Exception as e:
+        logger.error(f"Error in list_sessions: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 # ============= LOG ENDPOINTS =============
+
 
 @app.route('/api/logs/<container>/<session>', methods=['GET'])
 @require_authN(auth_db)
@@ -232,13 +234,15 @@ def get_data(user_id, token, container, session):
         stream = request.args.get('stream', 'false').lower() == 'true'
 
         # Create log reader using factory
-        reader = LogReaderFactory.create_from_metadata(metadata_db, container, session, buffer_dir=BUFFER_DIR)
+        reader = LogReaderFactory.create_from_metadata(
+            metadata_db, container, session, buffer_dir=BUFFER_DIR)
 
         # Parse timestamps if provided
         start_time = None
         end_time = None
         if start_ts:
-            start_time = datetime.fromisoformat(start_ts.replace('Z', '+00:00'))
+            start_time = datetime.fromisoformat(
+                start_ts.replace('Z', '+00:00'))
         if end_ts:
             end_time = datetime.fromisoformat(end_ts.replace('Z', '+00:00'))
 
@@ -286,9 +290,14 @@ def get_data(user_id, token, container, session):
             })
 
     except ValueError as e:
+        logger.error(f"Invalid timestamp format: {e}")
+        traceback.print_exc()
         return jsonify({'error': f'Invalid timestamp format: {str(e)}'}), 400
     except Exception as e:
+        logger.error(f"Error in get_data: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/logs/<container>/<session>', methods=['POST'])
 @require_authN(auth_db)
@@ -329,22 +338,27 @@ def post_data(user_id, token, container, session):
 
     except ValueError as e:
         # Validation errors from create_record_batch
+        logger.error(f"Validation error: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        print(f"Error in post_data: {e}")
+        logger.error(f"Error in post_data: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
 
 def cleanup_handler(signum=None, frame=None):
     """Gracefully shut down and flush all buffers"""
-    print("\nShutting down gracefully...")
+    logger.info("Shutting down gracefully...")
     try:
         buffer_manager.close_all()
         metadata_db.close()
         auth_db.close()
-        print("All buffers flushed and databases closed.")
+        logger.info("All buffers flushed and databases closed.")
     except Exception as e:
-        print(f"Error during cleanup: {e}")
+        logger.error(f"Error during cleanup: {e}")
     sys.exit(0)
+
 
 # Register signal handlers
 signal.signal(signal.SIGINT, cleanup_handler)
@@ -371,4 +385,4 @@ if __name__ == "__main__":
             metadata_db.close()
             auth_db.close()
         except Exception as e:
-            print(f"Error closing resources: {e}")
+            logger.error(f"Error closing resources: {e}")

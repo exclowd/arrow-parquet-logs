@@ -266,9 +266,9 @@ class BufferReader:
                 continue
 
             try:
-                # Memory-map the IPC file for efficient reading
+                # Read streaming IPC format (not file format)
                 with pa.memory_map(str(buffer_path), 'r') as source:
-                    reader = ipc.open_file(source)
+                    reader = ipc.open_stream(source)
                     table = reader.read_all()
 
                 # Apply filters if needed using FilterUtils
@@ -317,14 +317,15 @@ class BufferReader:
                 continue
 
             try:
-                # Memory-map the IPC file
+                # Read streaming IPC format
                 with pa.memory_map(str(buffer_path), 'r') as source:
-                    reader = ipc.open_file(source)
+                    reader = ipc.open_stream(source)
 
-                    # Read and process in batches
-                    for i in range(reader.num_record_batches):
-                        batch = reader.get_batch(i)
-
+                    # Stream format doesn't support random access by batch index
+                    # Read all batches sequentially
+                    table = reader.read_all()
+                    
+                    for batch in table.to_batches():
                         # Apply filters using FilterUtils
                         if filters:
                             mask = FilterUtils.build_arrow_mask(batch, filters)
@@ -362,12 +363,12 @@ class BufferReader:
 
             try:
                 with pa.memory_map(str(buffer_path), 'r') as source:
-                    reader = ipc.open_file(source)
+                    reader = ipc.open_stream(source)
 
-                    # If filters, need to read and apply them
+                    # Read table and count rows
                     if filters:
-                        for i in range(reader.num_record_batches):
-                            batch = reader.get_batch(i)
+                        table = reader.read_all()
+                        for batch in table.to_batches():
                             mask = FilterUtils.build_arrow_mask(batch, filters)
                             if mask is not None:
                                 filtered_batch = batch.filter(mask)
@@ -376,9 +377,8 @@ class BufferReader:
                                 total += batch.num_rows
                     else:
                         # Just count rows
-                        for i in range(reader.num_record_batches):
-                            batch = reader.get_batch(i)
-                            total += batch.num_rows
+                        table = reader.read_all()
+                        total += table.num_rows
             except Exception:
                 # Skip corrupted files
                 continue
@@ -403,13 +403,12 @@ class BufferReader:
             try:
                 files_scanned += 1
 
-                # Read IPC file metadata
+                # Read streaming IPC file metadata
                 with pa.memory_map(str(buffer_path), 'r') as source:
-                    reader = ipc.open_file(source)
-                    # Count rows in all batches
-                    for i in range(reader.num_record_batches):
-                        batch = reader.get_batch(i)
-                        total_rows += batch.num_rows
+                    reader = ipc.open_stream(source)
+                    # Read all and count rows
+                    table = reader.read_all()
+                    total_rows += table.num_rows
 
                 total_size += buffer_path.stat().st_size
             except Exception:

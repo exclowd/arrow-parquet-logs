@@ -5,10 +5,13 @@ from pathlib import Path
 from typing import Dict, Optional
 import threading
 import os
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from metadata import MetadataDB
 from schema import LOG_SCHEMA
+
+logger = logging.getLogger(__name__)
 
 # Shared thread pool for async buffer flushing (bounded, prevents thread explosion)
 FLUSH_POOL = ThreadPoolExecutor(
@@ -51,16 +54,24 @@ def create_record_batch(logs: list, container: str, session: str) -> pa.RecordBa
 
     n = len(logs)
 
+    # Validate container and session are strings (not numbers)
+    if not isinstance(container, str):
+        raise ValueError(f"Container must be a string, got {type(container).__name__}: {container!r}")
+    if not isinstance(session, str):
+        raise ValueError(f"Session must be a string, got {type(session).__name__}: {session!r}")
+
     try:
-        # Arrow parses ISO 8601 timestamps in C++ (fast!)
-        timestamps = pa.array(timestamps_raw, type=pa.timestamp("us", tz="UTC"))
+        # Infer type as string first, then cast to timestamp
+        # This handles ISO 8601 strings with 'Z' suffix correctly
+        timestamps = pa.array(timestamps_raw)  # infer type as string
+        timestamps = timestamps.cast(pa.timestamp("us", tz="UTC"))
 
         levels    = pa.array(levels_raw,   type=pa.string())
         messages  = pa.array(messages_raw, type=pa.string())
 
-        # Faster than Python repetition: Arrow-level repeat
-        container_col = pa.array([container], type=pa.string()).repeat(n)
-        session_col   = pa.array([session],   type=pa.string()).repeat(n)
+        # Constant columns (container/session) repeated
+        container_col = pa.array([container] * n, type=pa.string())
+        session_col   = pa.array([session]   * n, type=pa.string())
 
         return pa.RecordBatch.from_arrays(
             [timestamps, levels, messages, container_col, session_col],
@@ -68,7 +79,19 @@ def create_record_batch(logs: list, container: str, session: str) -> pa.RecordBa
         )
 
     except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
-        raise ValueError(f"Arrow validation failed: {e}") from e
+        # Add detailed error message with sample data for debugging
+        error_msg = f"Arrow validation failed: {e}\n"
+        error_msg += f"Sample data (first log entry):\n"
+        error_msg += f"  timestamp: {timestamps_raw[0]!r} (type: {type(timestamps_raw[0]).__name__})\n"
+        error_msg += f"  level: {levels_raw[0]!r} (type: {type(levels_raw[0]).__name__})\n"
+        error_msg += f"  message: {messages_raw[0]!r} (type: {type(messages_raw[0]).__name__})\n"
+        error_msg += f"  container: {container!r} (type: {type(container).__name__})\n"
+        error_msg += f"  session: {session!r} (type: {type(session).__name__})"
+
+        import traceback
+        traceback.print_exc()
+        raise ValueError(error_msg) from e
+
 
 
 class BufferManager:
@@ -171,27 +194,32 @@ class SessionBuffer:
 
         archive_path = Path(youngest['archive_path'])
         if not archive_path.exists():
-            print(f"Warning: Archive file not found: {archive_path}")
+            logger.warning(f"Archive file not found: {archive_path}")
             return
 
         try:
-            # Read the Parquet file
+            # Read the Parquet file preserving Arrow types
             table = pq.read_table(archive_path)
+
+            # Validate schema matches before loading
+            if not table.schema.equals(LOG_SCHEMA):
+                logger.warning(f"Archive schema mismatch. Expected {LOG_SCHEMA}, got {table.schema}. Skipping load.")
+                return
 
             # Convert to Arrow IPC buffer
             self._init_new_buffer()
             assert self.current_writer is not None
 
-            # Write all batches from the table
+            # Write all batches from the table (preserving Arrow types)
             for batch in table.to_batches():
                 self.current_writer.write_batch(batch)
                 self.current_size += batch.nbytes
 
-            print(f"Loaded youngest archive {archive_path.name} back into buffer "
-                  f"({youngest['num_rows']} rows, {youngest['file_size']} bytes)")
+            logger.info(f"Loaded youngest archive {archive_path.name} back into buffer "
+                       f"({youngest['num_rows']} rows, {youngest['file_size']} bytes)")
 
         except Exception as e:
-            print(f"Error loading youngest archive: {e}")
+            logger.error(f"Error loading youngest archive: {e}")
             # If we failed, ensure we have a clean state
             if self.current_writer is not None:
                 self.current_writer.close()
@@ -301,11 +329,10 @@ class SessionBuffer:
             # Delete local buffer file
             buffer_file.unlink(missing_ok=True)
 
-            print(
-                f"Successfully flushed buffer {buffer_file.name} to archive: {archive_file}")
+            logger.info(f"Successfully flushed buffer {buffer_file.name} to archive: {archive_file}")
 
         except Exception as e:
-            print(f"[ERROR] Failure processing buffer {buffer_file}: {e}")
+            logger.error(f"Failure processing buffer {buffer_file}: {e}")
 
     def _insert_metadata(self, archive_path: str, num_rows: int, file_size: int):
         """Insert metadata entry into SQLite database"""
@@ -317,10 +344,9 @@ class SessionBuffer:
                 num_rows,
                 file_size
             )
-            print(
-                f"Metadata inserted for {archive_path}: {num_rows} rows, {file_size} bytes")
+            logger.info(f"Metadata inserted for {archive_path}: {num_rows} rows, {file_size} bytes")
         except Exception as e:
-            print(f"Error inserting metadata: {e}")
+            logger.error(f"Error inserting metadata: {e}")
 
     def close(self):
         """Close and flush current buffer"""
