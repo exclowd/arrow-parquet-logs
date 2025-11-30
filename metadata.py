@@ -7,7 +7,6 @@ class MetadataDB:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.lock = threading.Lock()
-        # Fix: Use persistent connection with WAL mode
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
@@ -52,6 +51,28 @@ class MetadataDB:
                 ORDER BY created_at DESC
             """, (container, session))
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_youngest_archive(self, container: str, session: str):
+        """Get the most recently created archive for a session"""
+        with self.lock:
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.execute("""
+                SELECT * FROM log_files
+                WHERE container = ? AND session = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (container, session))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_file_metadata(self, file_id: int):
+        """Delete a file metadata entry by ID"""
+        with self.lock:
+            self.conn.execute("""
+                DELETE FROM log_files
+                WHERE id = ?
+            """, (file_id,))
+            self.conn.commit()
 
     def close(self):
         """Close database connection"""

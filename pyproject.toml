@@ -8,4 +8,5 @@ dependencies = [
     "flask>=3.1.2",
     "foundationdb>=7.4.5",
     "pyarrow>=21.0.0",
+    "requests>=2.32.5",
 ]

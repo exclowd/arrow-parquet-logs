@@ -4,7 +4,6 @@ import signal
 import sys
 import json
 from datetime import datetime
-import traceback
 
 from auth import require_authN, AuthDB
 from metadata import MetadataDB
@@ -66,7 +65,6 @@ def home():
 
 # ============= AUTH ENDPOINTS =============
 
-
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     """Login and receive authentication token"""
@@ -95,7 +93,6 @@ def login():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/auth/logout', methods=['POST'])
 @require_authN(auth_db)
 def logout(user_id, token):
@@ -107,7 +104,6 @@ def logout(user_id, token):
         return jsonify({'error': str(e)}), 500
 
 # ============= CONTAINER ENDPOINTS =============
-
 
 @app.route('/api/containers', methods=['POST'])
 @require_authN(auth_db)
@@ -138,7 +134,6 @@ def create_container(user_id, token):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/containers', methods=['GET'])
 @require_authN(auth_db)
 def list_containers(user_id, token):
@@ -154,7 +149,6 @@ def list_containers(user_id, token):
         return jsonify({'error': str(e)}), 500
 
 # ============= SESSION ENDPOINTS =============
-
 
 @app.route('/api/containers/<container_id>/sessions', methods=['POST'])
 @require_authN(auth_db)
@@ -192,7 +186,6 @@ def create_session(user_id, token, container_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/containers/<container_id>/sessions', methods=['GET'])
 @require_authN(auth_db)
 def list_sessions(user_id, token, container_id):
@@ -210,8 +203,7 @@ def list_sessions(user_id, token, container_id):
             session_copy = session.copy()
             # Remove container prefix if present
             if session_copy['session_id'].startswith(prefix):
-                session_copy['session_id'] = session_copy['session_id'][len(
-                    prefix):]
+                session_copy['session_id'] = session_copy['session_id'][len(prefix):]
             formatted_sessions.append(session_copy)
 
         return jsonify({
@@ -224,7 +216,6 @@ def list_sessions(user_id, token, container_id):
         return jsonify({'error': str(e)}), 500
 
 # ============= LOG ENDPOINTS =============
-
 
 @app.route('/api/logs/<container>/<session>', methods=['GET'])
 @require_authN(auth_db)
@@ -240,16 +231,14 @@ def get_data(user_id, token, container, session):
         end_ts = request.args.get('end_ts')
         stream = request.args.get('stream', 'false').lower() == 'true'
 
-        # Create log reader using factory (includes both archive and buffer files)
-        reader = LogReaderFactory.create_from_metadata(
-            metadata_db, container, session, BUFFER_DIR)
+        # Create log reader using factory
+        reader = LogReaderFactory.create_from_metadata(metadata_db, container, session, buffer_dir=BUFFER_DIR)
 
         # Parse timestamps if provided
         start_time = None
         end_time = None
         if start_ts:
-            start_time = datetime.fromisoformat(
-                start_ts.replace('Z', '+00:00'))
+            start_time = datetime.fromisoformat(start_ts.replace('Z', '+00:00'))
         if end_ts:
             end_time = datetime.fromisoformat(end_ts.replace('Z', '+00:00'))
 
@@ -272,7 +261,6 @@ def get_data(user_id, token, container, session):
         # Stream large result sets
         if stream:
             def generate():
-                # Fix: Use json.dumps for proper escaping of container and session names
                 yield '{"container":' + json.dumps(container) + ',"session":' + json.dumps(session) + ',"logs":['
                 # Use LogReader's stream_json for efficient streaming
                 for chunk in reader.stream_json(batch_size=1000):
@@ -301,7 +289,6 @@ def get_data(user_id, token, container, session):
         return jsonify({'error': f'Invalid timestamp format: {str(e)}'}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/logs/<container>/<session>', methods=['POST'])
 @require_authN(auth_db)
@@ -344,9 +331,8 @@ def post_data(user_id, token, container, session):
         # Validation errors from create_record_batch
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        print(''.join(traceback.TracebackException.from_exception(e).format()))
+        print(f"Error in post_data: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 def cleanup_handler(signum=None, frame=None):
     """Gracefully shut down and flush all buffers"""
@@ -359,7 +345,6 @@ def cleanup_handler(signum=None, frame=None):
     except Exception as e:
         print(f"Error during cleanup: {e}")
     sys.exit(0)
-
 
 # Register signal handlers
 signal.signal(signal.SIGINT, cleanup_handler)

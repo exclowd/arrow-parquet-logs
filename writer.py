@@ -2,18 +2,25 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 from pathlib import Path
-from datetime import datetime
 from typing import Dict, Optional
 import threading
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 from metadata import MetadataDB
 from schema import LOG_SCHEMA
 
+# Shared thread pool for async buffer flushing (bounded, prevents thread explosion)
+FLUSH_POOL = ThreadPoolExecutor(
+    max_workers=os.cpu_count() or 4,
+    thread_name_prefix="buffer-flush"
+)
+
 
 def create_record_batch(logs: list, container: str, session: str) -> pa.RecordBatch:
     """
-    Convert log entries to Arrow RecordBatch with validation.
-    This function performs all validation using Arrow's type system.
+    Convert log entries to Arrow RecordBatch with vectorized validation.
+    Arrow handles timestamp parsing and type checking internally.
 
     Args:
         logs: List of log dictionaries with 'timestamp', 'level', 'message' fields
@@ -29,51 +36,37 @@ def create_record_batch(logs: list, container: str, session: str) -> pa.RecordBa
     if not logs:
         raise ValueError("Empty logs array")
 
-    timestamps = []
-    levels = []
-    messages = []
-    containers = []
-    sessions = []
+    # Validate logs is a list of dicts
+    if not all(isinstance(log, dict) for log in logs):
+        raise ValueError("All log entries must be dictionaries")
 
-    for i, log in enumerate(logs):
-        # Validate log is a dictionary
-        if not isinstance(log, dict):
-            raise ValueError(f"Log entry at index {i} must be an object")
-
-        # Validate required fields exist
-        if 'timestamp' not in log:
-            raise ValueError(f"Log entry at index {i} missing required field 'timestamp'")
-        if 'level' not in log:
-            raise ValueError(f"Log entry at index {i} missing required field 'level'")
-        if 'message' not in log:
-            raise ValueError(f"Log entry at index {i} missing required field 'message'")
-
-        # Parse and validate timestamp (ISO 8601 only)
-        ts = log['timestamp']
-        if not isinstance(ts, str):
-            raise ValueError(f"Log entry at index {i}: timestamp must be an ISO 8601 string, got {type(ts).__name__}")
-
-        try:
-            dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-            ts_us = int(dt.timestamp() * 1_000_000)
-        except (ValueError, AttributeError) as e:
-            raise ValueError(f"Log entry at index {i}: invalid ISO 8601 timestamp format: {ts}") from e
-
-        timestamps.append(ts_us)
-        levels.append(str(log['level']))
-        messages.append(str(log['message']))
-        containers.append(container)
-        sessions.append(session)
-
-    # Use Arrow to create the batch - Arrow will validate types
+    # Extract required fields vectorized
     try:
-        return pa.RecordBatch.from_arrays([
-            pa.array(timestamps, type=pa.timestamp('us', tz='UTC')),
-            pa.array(levels, type=pa.string()),
-            pa.array(messages, type=pa.string()),
-            pa.array(containers, type=pa.string()),
-            pa.array(sessions, type=pa.string()),
-        ], schema=LOG_SCHEMA)
+        timestamps_raw = [log["timestamp"] for log in logs]
+        levels_raw     = [log["level"]     for log in logs]
+        messages_raw   = [log["message"]   for log in logs]
+    except KeyError as e:
+        missing = e.args[0]
+        raise ValueError(f"Missing required field '{missing}' in at least one log entry")
+
+    n = len(logs)
+
+    try:
+        # Arrow parses ISO 8601 timestamps in C++ (fast!)
+        timestamps = pa.array(timestamps_raw, type=pa.timestamp("us", tz="UTC"))
+
+        levels    = pa.array(levels_raw,   type=pa.string())
+        messages  = pa.array(messages_raw, type=pa.string())
+
+        # Faster than Python repetition: Arrow-level repeat
+        container_col = pa.array([container], type=pa.string()).repeat(n)
+        session_col   = pa.array([session],   type=pa.string()).repeat(n)
+
+        return pa.RecordBatch.from_arrays(
+            [timestamps, levels, messages, container_col, session_col],
+            schema=LOG_SCHEMA
+        )
+
     except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
         raise ValueError(f"Arrow validation failed: {e}") from e
 
@@ -126,13 +119,12 @@ class SessionBuffer:
                  ):
         self.container = container
         self.session = session
-        # Fix: Include container in session_dir to avoid collisions
+
         self.session_dir = buffer_dir / container / f"session_{session}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.archive_dir = archive_dir / container / f"session_{session}"
         self.archive_dir.mkdir(parents=True, exist_ok=True)
 
-        # Fix: Initialize buffer counter from existing files to avoid overwriting
         self.buffer_counter = self._get_last_buffer_number()
         self.buffer_size_limit = buffer_size_limit
         self.metadata_db = metadata_db
@@ -142,26 +134,79 @@ class SessionBuffer:
         self.current_size = 0
         self.lock = threading.Lock()
 
+        # Load youngest archive back into buffer if it's small enough
+        self._load_youngest_archive_if_small()
+
     def _get_last_buffer_number(self) -> int:
-        """Get the highest buffer number from existing files"""
-        existing = list(self.session_dir.glob("buffer-*.arrow"))
-        if not existing:
+        """Track buffer counter in a small local file instead of scanning the directory."""
+        counter_file = self.session_dir / "counter.txt"
+
+        if not counter_file.exists():
+            counter_file.write_text("0")
             return 0
-        numbers = []
-        for f in existing:
-            try:
-                num = int(f.stem.split('-')[1])
-                numbers.append(num)
-            except (IndexError, ValueError):
-                continue
-        return max(numbers) if numbers else 0
+
+        try:
+            return int(counter_file.read_text().strip())
+        except Exception:
+            return 0
 
     def _get_next_buffer_path(self) -> Path:
         self.buffer_counter += 1
+        (self.session_dir / "counter.txt").write_text(str(self.buffer_counter))
         return self.session_dir / f"buffer-{self.buffer_counter:04d}.arrow"
+
+    def _load_youngest_archive_if_small(self):
+        """
+        Check if the youngest archive is small enough to be loaded back into the buffer.
+        If so, load it back into the current buffer without deleting the archive or metadata.
+        """
+        youngest = self.metadata_db.get_youngest_archive(self.container, self.session)
+
+        if youngest is None:
+            return  # No archives yet
+
+        # Check if the archive is small enough (less than half the buffer limit)
+        if youngest['file_size'] >= self.buffer_size_limit / 2:
+            return  # Archive is too large
+
+        archive_path = Path(youngest['archive_path'])
+        if not archive_path.exists():
+            print(f"Warning: Archive file not found: {archive_path}")
+            return
+
+        try:
+            # Read the Parquet file
+            table = pq.read_table(archive_path)
+
+            # Convert to Arrow IPC buffer
+            self._init_new_buffer()
+            assert self.current_writer is not None
+
+            # Write all batches from the table
+            for batch in table.to_batches():
+                self.current_writer.write_batch(batch)
+                self.current_size += batch.nbytes
+
+            print(f"Loaded youngest archive {archive_path.name} back into buffer "
+                  f"({youngest['num_rows']} rows, {youngest['file_size']} bytes)")
+
+        except Exception as e:
+            print(f"Error loading youngest archive: {e}")
+            # If we failed, ensure we have a clean state
+            if self.current_writer is not None:
+                self.current_writer.close()
+            if self.current_sink is not None:
+                self.current_sink.close()
+            self.current_writer = None
+            self.current_sink = None
+            self.current_file = None
+            self.current_size = 0
 
     def append_batch(self, batch: pa.RecordBatch):
         """Append an Arrow RecordBatch to the buffer"""
+        rotate_now = False
+        buffer_file = None
+
         with self.lock:
             # Initialize writer if needed
             if self.current_writer is None:
@@ -172,70 +217,76 @@ class SessionBuffer:
             # Write batch to buffer
             self.current_writer.write_batch(batch)
 
-            # Fix: Track size using batch's memory size as approximation
-            # This is faster than disk I/O and close enough for flush threshold
+            # Track size using batch's memory size
             self.current_size += batch.nbytes
 
-            # Check if we need to flush
+            # Determine if we need rotation
             if self.current_size >= self.buffer_size_limit:
-                self._flush_buffer()
+                buffer_file = self._rotate_buffer_locked()
+                rotate_now = True
 
-    def _init_new_buffer(self):
-        """Initialize a new Arrow IPC buffer file"""
-        self.current_file = self._get_next_buffer_path()
-        # Fix: Use output_stream instead of OSFile with mode
-        self.current_sink = pa.output_stream(str(self.current_file))
-        self.current_writer = ipc.new_file(self.current_sink, LOG_SCHEMA)
-        self.current_size = 0
+        # Flush outside of lock for maximum concurrency
+        if rotate_now:
+            assert buffer_file is not None
+            FLUSH_POOL.submit(self._process_buffer, buffer_file)
 
-    def _flush_buffer(self, do_async: bool = True):
-        """Flush current buffer: convert to Parquet and archive"""
-        if self.current_writer is None:
-            return
-
-        self.current_writer.close()
-        if self.current_sink is not None:
+    def _rotate_buffer_locked(self) -> Path:
+        """Rotate current writer to a new file. Must be called under lock."""
+        if self.current_writer:
+            self.current_writer.close()
+        if self.current_sink:
             self.current_sink.close()
 
-        assert self.current_file is not None
-        buffer_file = self.current_file
+        old_file = self.current_file
+        assert old_file is not None, "Cannot rotate buffer without an active file"
 
-        # Reset for next buffer
+        # Prepare new buffer
         self.current_writer = None
         self.current_sink = None
         self.current_file = None
         self.current_size = 0
 
-        if not do_async:
-            assert buffer_file is not None
-            self._process_buffer(buffer_file)
-            return
+        self._init_new_buffer()
 
-        # Process asynchronously
-        thread = threading.Thread(
-            target=self._process_buffer,
-            args=(buffer_file,),
-            name=f"flush-{self.container}-{self.session}"
-        )
-        thread.daemon = True
-        thread.start()
+        return old_file
+
+    def _init_new_buffer(self):
+        """Initialize a new Arrow IPC buffer file using StreamWriter (faster for append-only)"""
+        self.current_file = self._get_next_buffer_path()
+        self.current_sink = pa.output_stream(str(self.current_file))
+        self.current_writer = ipc.new_stream(self.current_sink, LOG_SCHEMA)
+        self.current_size = 0
+
+    def _flush_buffer(self, do_async: bool = True):
+        """Flush current buffer: convert to Parquet and archive"""
+        with self.lock:
+            if self.current_writer is None:
+                return
+            buffer_file = self._rotate_buffer_locked()
+
+        if do_async:
+            FLUSH_POOL.submit(self._process_buffer, buffer_file)
+        else:
+            self._process_buffer(buffer_file)
 
     def _process_buffer(self, buffer_file: Path):
         """Async processing: Arrow -> Parquet -> Archive -> Delete"""
         try:
-            # Fix: Use memory-mapped I/O for zero-copy reading
-            with pa.memory_map(str(buffer_file), 'r') as source:
-                reader = ipc.open_file(source)
+            # Prefer input_stream for smaller files (faster than mmap for <50MB)
+            with pa.input_stream(str(buffer_file)) as source:
+                reader = ipc.open_stream(source)
                 table = reader.read_all()
 
-            # Convert to Parquet with optimizations
+            # Convert to Parquet with optimized settings
             parquet_file = buffer_file.with_suffix('.parquet')
             pq.write_table(
                 table,
                 parquet_file,
                 compression='snappy',
                 use_dictionary=True,
+                write_statistics=True,
                 data_page_size=65536,
+                dictionary_pagesize_limit=65536,
                 coerce_timestamps='us'
             )
 
@@ -248,13 +299,13 @@ class SessionBuffer:
                 str(archive_file), table.num_rows, archive_file.stat().st_size)
 
             # Delete local buffer file
-            buffer_file.unlink()
+            buffer_file.unlink(missing_ok=True)
 
             print(
                 f"Successfully flushed buffer {buffer_file.name} to archive: {archive_file}")
 
         except Exception as e:
-            print(f"Error processing buffer {buffer_file}: {e}")
+            print(f"[ERROR] Failure processing buffer {buffer_file}: {e}")
 
     def _insert_metadata(self, archive_path: str, num_rows: int, file_size: int):
         """Insert metadata entry into SQLite database"""

@@ -439,10 +439,17 @@ class LogReader:
         all_logs = []
 
         # Read from archive files
-        all_logs.extend(self.archive_reader.read_all(self.filters if self.filters else None))
+        archive_logs = self.archive_reader.read_all(self.filters if self.filters else None)
 
-        # Read from buffer files
-        all_logs.extend(self.buffer_reader.read_all(self.filters if self.filters else None))
+        print(f"Debug: Retrieved {len(archive_logs)} logs from archive files.")
+
+        all_logs.extend(archive_logs)
+
+        buffer_logs = self.buffer_reader.read_all(self.filters if self.filters else None)
+
+        print(f"Debug: Retrieved {len(buffer_logs)} logs from buffer files.")
+
+        all_logs.extend(buffer_logs)
 
         return all_logs
 
@@ -535,13 +542,15 @@ class LogReaderFactory:
         # Get archived files from metadata DB
         archive_files = metadata_db.get_session_files(container, session)
 
+        print(f"Debug: Found {len(archive_files)} archived files for container '{container}', session '{session}'.")
+
         # Get active buffer files from file system
         session_buffer_dir = buffer_dir / container / f"session_{session}"
         buffer_files = []
         if session_buffer_dir.exists():
             buffer_files = sorted(session_buffer_dir.glob("buffer-*.arrow"))
 
-        # Create readers
+        print(f"Debug: Found {buffer_files=} buffer files for container '{container}', session '{session}'.")
         archive_reader = ArchiveReader(archive_files)
         buffer_reader = BufferReader(buffer_files)
 
